@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "psycopg-ra-tls"
+version = "0.1.0"
+description = "psycopg3 driver with RA-TLS attestation verification for dstack TEE databases"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "psycopg[binary]>=3.1",
+    "ra-tls-verify>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/psycopg_ratls"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
