@@ -10,6 +10,7 @@ import asyncio
 import ssl
 import logging
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import psycopg
 import psycopg.rows
@@ -20,7 +21,54 @@ from ra_tls_verify import (
     extract_tdx_quote,
 )
 
+# Placeholder password sent to the proxy when the DSN contains no password.
+# The dstackgres sidecar proxy discards whatever password the client sends
+# and substitutes the KMS-derived password before forwarding to Postgres,
+# so the actual value here never leaves the client.
+_RATLS_PLACEHOLDER_PASSWORD = "ratls"
+
 logger = logging.getLogger(__name__)
+
+
+def _inject_placeholder_password(dsn: str) -> str:
+    """Return a DSN guaranteed to have a password field.
+
+    If the DSN already contains a password, it is returned unchanged (backward
+    compatible). If no password is present, the ``_RATLS_PLACEHOLDER_PASSWORD``
+    placeholder is injected. The dstackgres sidecar proxy replaces whatever
+    password the client sends with the KMS-derived credential, so the actual
+    value is irrelevant — Postgres just requires *something* on the wire.
+
+    Only ``postgresql://`` / ``postgres://`` URI schemes are supported here.
+    Key=value DSNs (``host=... password=...``) are returned as-is; psycopg
+    will use an empty password for those when no password key is present, which
+    the proxy will also replace correctly.
+    """
+    if not (dsn.startswith("postgresql://") or dsn.startswith("postgres://")):
+        # Key=value DSN or other format — leave untouched.
+        return dsn
+
+    parsed = urlparse(dsn)
+    if parsed.password is not None:
+        # Password already present — preserve it (backward compatibility).
+        return dsn
+
+    # Inject the placeholder password into the netloc.
+    # urlparse splits netloc as userinfo@host; userinfo may be "user" or absent.
+    userinfo, _, hostinfo = parsed.netloc.partition("@")
+    if not hostinfo:
+        # No "@" in netloc means there was no userinfo at all.
+        hostinfo = userinfo
+        userinfo = ""
+
+    if userinfo:
+        new_userinfo = f"{userinfo}:{_RATLS_PLACEHOLDER_PASSWORD}"
+    else:
+        new_userinfo = f":{_RATLS_PLACEHOLDER_PASSWORD}"
+
+    new_netloc = f"{new_userinfo}@{hostinfo}"
+    new_parsed = parsed._replace(netloc=new_netloc)
+    return urlunparse(new_parsed)
 
 
 def create_ssl_context(
@@ -167,8 +215,12 @@ def connect(
     Establishes a psycopg3 connection using TLS, extracts the TDX attestation
     quote from the server certificate, and verifies it before returning.
 
+    Uses cluster secret-based authentication. Include the permission level as the
+    username (teesql_read or teesql_readwrite) and the cluster secret as the password
+    in the connection string.
+
     Args:
-        dsn: PostgreSQL connection string.
+        dsn: PostgreSQL connection string with teesql_read/teesql_readwrite user and cluster secret password.
         verifier: Attestation verifier (IntelApiVerifier or NoopVerifier).
         options: Verification options.
         allow_simulator: Accept certs without attestation (dev only).
@@ -211,6 +263,7 @@ async def connect_async(
     """Async version of connect().
 
     Same attestation verification flow but returns an AsyncConnection.
+    Uses cluster secret-based authentication — see connect() for details.
     """
     options = options or VerifyOptions()
     if row_factory is None:
