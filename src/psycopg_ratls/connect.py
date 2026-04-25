@@ -1,13 +1,17 @@
 """RA-TLS verified psycopg3 connections to dstack TEE databases.
 
-Wraps psycopg3's connection with an SSL context that extracts and verifies
-TDX attestation quotes from the server's RA-TLS certificate on every connection.
+psycopg 0.8+ drives its own TLS handshake starting with the postgres
+``SSLRequest`` 8-byte preamble, which the dstack gateway's TLS-passthrough
+SNI router can't parse. See ``forwarder.py`` for the full rationale.
+
+The mitigation: this module starts an in-process localhost
+:class:`~psycopg_ratls.forwarder.RaTlsForwarder`, which terminates mutual
+RA-TLS against the cluster and bridges bytes. psycopg then connects to the
+forwarder with ``sslmode=disable``.
 """
 
 from __future__ import annotations
 
-import asyncio
-import ssl
 import logging
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -15,191 +19,139 @@ from urllib.parse import urlparse, urlunparse
 import psycopg
 import psycopg.rows
 
-from ra_tls_verify import (
-    RaTlsVerifier,
-    VerifyOptions,
-    extract_tdx_quote,
-)
+from dstack_sdk import DstackClient
+from ra_tls_verify import RaTlsVerifier, VerifyOptions
+
+from . import forwarder as _forwarder
+from .forwarder import RaTlsForwarder
 
 # Placeholder password sent to the proxy when the DSN contains no password.
-# The dstackgres sidecar proxy discards whatever password the client sends
-# and substitutes the KMS-derived password before forwarding to Postgres,
-# so the actual value here never leaves the client.
+# The sidecar proxy discards whatever password the client sends and
+# substitutes the KMS-derived password before forwarding to Postgres, so
+# the actual value here never leaves the client.
 _RATLS_PLACEHOLDER_PASSWORD = "ratls"
 
+# Timeout passed to DstackClient when fetching a client cert. Default
+# 3s is too tight — on a cold CVM the first cert request can take
+# several seconds to walk the guest-agent → KMS roundtrip.
+_DSTACK_CERT_TIMEOUT_SECS = 60
+
 logger = logging.getLogger(__name__)
+
+
+def _fetch_client_cert() -> tuple[str, str]:
+    """Fetch a short-lived, TDX-attested client cert from the dstack guest agent.
+
+    Returns ``(chain_pem, key_pem)`` — the chain concatenated as a single
+    PEM string, and the private key PEM. Both are mandatory for the
+    mutual-RA-TLS handshake against the teesql sidecar.
+    """
+    client = DstackClient(timeout=_DSTACK_CERT_TIMEOUT_SECS)
+    resp = client.get_tls_key(
+        usage_ra_tls=True,
+        usage_server_auth=True,
+        usage_client_auth=True,
+    )
+    chain_pem = "\n".join(resp.certificate_chain)
+    if not chain_pem.endswith("\n"):
+        chain_pem += "\n"
+    return chain_pem, resp.key
+
+
+def _parse_target(dsn: str) -> tuple[str, int, str]:
+    """Extract ``(host, port, rest_of_dsn)`` from a URL-style DSN.
+
+    Returns the host, port, and the DSN rewritten to a localhost listener
+    placeholder — the caller substitutes in the forwarder's bound
+    ``(host, port)`` before passing to psycopg.
+    """
+    if not (dsn.startswith("postgresql://") or dsn.startswith("postgres://")):
+        raise ValueError(
+            "psycopg-ra-tls requires a URI-form DSN (postgresql://user:pw@host:port/db)"
+        )
+    parsed = urlparse(dsn)
+    host = parsed.hostname
+    port = parsed.port or 5432
+    if not host:
+        raise ValueError("DSN has no host")
+    return host, port, dsn
 
 
 def _inject_placeholder_password(dsn: str) -> str:
     """Return a DSN guaranteed to have a password field.
 
-    If the DSN already contains a password, it is returned unchanged (backward
-    compatible). If no password is present, the ``_RATLS_PLACEHOLDER_PASSWORD``
-    placeholder is injected. The dstackgres sidecar proxy replaces whatever
-    password the client sends with the KMS-derived credential, so the actual
-    value is irrelevant — Postgres just requires *something* on the wire.
-
-    Only ``postgresql://`` / ``postgres://`` URI schemes are supported here.
-    Key=value DSNs (``host=... password=...``) are returned as-is; psycopg
-    will use an empty password for those when no password key is present, which
-    the proxy will also replace correctly.
+    The sidecar's wire-protocol auth-injection replaces whatever password
+    the client sent with the KMS-derived credential, so we only need the
+    DSN to contain *something* for psycopg's URL parser.
     """
     if not (dsn.startswith("postgresql://") or dsn.startswith("postgres://")):
-        # Key=value DSN or other format — leave untouched.
         return dsn
-
     parsed = urlparse(dsn)
     if parsed.password is not None:
-        # Password already present — preserve it (backward compatibility).
         return dsn
-
-    # Inject the placeholder password into the netloc.
-    # urlparse splits netloc as userinfo@host; userinfo may be "user" or absent.
     userinfo, _, hostinfo = parsed.netloc.partition("@")
     if not hostinfo:
-        # No "@" in netloc means there was no userinfo at all.
         hostinfo = userinfo
         userinfo = ""
-
     if userinfo:
         new_userinfo = f"{userinfo}:{_RATLS_PLACEHOLDER_PASSWORD}"
     else:
         new_userinfo = f":{_RATLS_PLACEHOLDER_PASSWORD}"
-
     new_netloc = f"{new_userinfo}@{hostinfo}"
-    new_parsed = parsed._replace(netloc=new_netloc)
-    return urlunparse(new_parsed)
+    return urlunparse(parsed._replace(netloc=new_netloc))
 
 
-def create_ssl_context(
-    verifier: RaTlsVerifier,
-    options: VerifyOptions | None = None,
-    allow_simulator: bool = False,
-) -> ssl.SSLContext:
-    """Create an SSL context that verifies RA-TLS attestation on connection.
+def _rewrite_to_forwarder(dsn: str, local_host: str, local_port: int) -> str:
+    """Rewrite a URL DSN's host/port to the forwarder's local address and
+    force ``sslmode=disable``.
 
-    The returned context can be passed to psycopg3 as the `sslcontext` parameter.
-    On each TLS handshake, the server certificate is checked for a TDX attestation
-    quote. If found, the quote is verified using the provided verifier. If verification
-    fails, the connection is refused.
-
-    Args:
-        verifier: Attestation verifier (IntelApiVerifier or NoopVerifier).
-        options: Verification options (MRTD allowlist, debug mode).
-        allow_simulator: Accept certs without attestation extensions (dev only).
+    The forwarder terminates TLS against the cluster; by the time the
+    postgres wire protocol flows, we're talking plain TCP across
+    loopback. ``sslmode=disable`` avoids psycopg attempting its own TLS
+    upgrade on top.
     """
-    options = options or VerifyOptions()
+    parsed = urlparse(dsn)
+    userinfo, _, _ = parsed.netloc.partition("@")
+    if not userinfo:
+        # No userinfo → impossible for teesql sidecar (needs teesql_read/
+        # teesql_readwrite), but tolerate for generic dstack postgres.
+        userinfo = f":{_RATLS_PLACEHOLDER_PASSWORD}"
+    elif ":" not in userinfo:
+        # username but no password — add placeholder.
+        userinfo = f"{userinfo}:{_RATLS_PLACEHOLDER_PASSWORD}"
+    new_netloc = f"{userinfo}@{local_host}:{local_port}"
 
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    # RA-TLS certs are self-signed with attestation as the trust anchor,
-    # not a traditional CA chain. Disable default cert verification --
-    # we verify trust through the attestation quote instead.
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_REQUIRED
+    # Merge query: force sslmode=disable (overrides any sslmode in the
+    # caller's DSN).
+    query = parsed.query
+    params = [q for q in query.split("&") if q and not q.startswith("sslmode=")]
+    params.append("sslmode=disable")
+    new_query = "&".join(params)
 
-    # Accept any certificate so we can inspect it in post_handshake
-    ctx.load_default_certs()
-
-    # Store verification state for the callback
-    _verify_state: dict[str, Any] = {
-        "verifier": verifier,
-        "options": options,
-        "allow_simulator": allow_simulator,
-    }
-
-    # We override verify to always accept during handshake, then
-    # do attestation verification after the handshake completes.
-    # This is necessary because RA-TLS certs are self-signed.
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-    # Attach state for post-handshake verification
-    ctx._ratls_state = _verify_state  # type: ignore[attr-defined]
-
-    return ctx
+    return urlunparse(parsed._replace(netloc=new_netloc, query=new_query))
 
 
-def _verify_peer_cert(
-    conn: psycopg.Connection[Any],
+def _start_forwarder(
+    target_host: str,
+    target_port: int,
     verifier: RaTlsVerifier,
-    options: VerifyOptions,
+    options: VerifyOptions | None,
     allow_simulator: bool,
-) -> None:
-    """Verify the peer certificate's attestation quote after connection."""
-    pgconn = conn.pgconn
-
-    # psycopg exposes the raw SSL object, but we need to get the peer cert
-    # via the underlying socket's SSL info
-    ssl_obj = pgconn.ssl_attribute("server_certificate_der")
-    if ssl_obj is None:
-        # Try getting the cert from the connection info
-        # psycopg3 doesn't directly expose DER cert, so we use the socket
-        sock = pgconn.socket
-        if sock <= 0:
-            if allow_simulator:
-                logger.warning("No SSL socket available, skipping attestation (simulator mode)")
-                return
-            raise RuntimeError("No SSL connection established")
-
-    # Get the DER-encoded server certificate
-    der_cert = _get_server_cert_der(pgconn)
-    if der_cert is None:
-        if allow_simulator:
-            logger.warning("Could not extract server certificate, skipping attestation")
-            return
-        raise RuntimeError("Could not extract server certificate for attestation")
-
-    quote = extract_tdx_quote(der_cert)
-    if quote is None:
-        if allow_simulator:
-            logger.warning("Server cert has no TDX attestation extension (simulator mode)")
-            return
-        raise RuntimeError(
-            "Server certificate does not contain a TDX attestation extension. "
-            "Set allow_simulator=True for non-TEE connections."
-        )
-
-    # Run async verification synchronously
-    result = asyncio.run(verifier.verify(quote, options))
-    logger.info(
-        "RA-TLS verification passed: mrtd=%s tcb=%s",
-        result.mr_td[:16] + "...",
-        result.tcb_status,
+) -> RaTlsForwarder:
+    """Create + start an RA-TLS forwarder, keep a module-level reference."""
+    chain_pem, key_pem = _fetch_client_cert()
+    fwd = RaTlsForwarder(
+        target_host=target_host,
+        target_port=target_port,
+        client_cert_chain_pem=chain_pem,
+        client_key_pem=key_pem,
+        verifier=verifier,
+        options=options,
+        allow_simulator=allow_simulator,
     )
-
-
-def _get_server_cert_der(pgconn: Any) -> bytes | None:
-    """Extract the server's DER-encoded certificate from a psycopg connection."""
-    try:
-        import ctypes
-
-        # psycopg3 exposes ssl_attribute which can get cert data
-        # but for DER we need to go through the C API
-        cert_pem = pgconn.ssl_attribute("server_certificate")
-        if cert_pem:
-            from cryptography.x509 import load_pem_x509_certificate
-            from cryptography.hazmat.primitives.serialization import Encoding
-
-            cert = load_pem_x509_certificate(cert_pem.encode())
-            return cert.public_bytes(Encoding.DER)
-    except Exception:
-        pass
-
-    # Fallback: try libpq's PQsslAttribute
-    try:
-        cert_pem = pgconn.ssl_attribute("server_certificate")
-        if cert_pem:
-            from cryptography.x509 import load_pem_x509_certificate
-            from cryptography.hazmat.primitives.serialization import Encoding
-
-            cert = load_pem_x509_certificate(
-                cert_pem if isinstance(cert_pem, bytes) else cert_pem.encode()
-            )
-            return cert.public_bytes(Encoding.DER)
-    except Exception:
-        pass
-
-    return None
+    fwd.start()
+    _forwarder.register(fwd)
+    return fwd
 
 
 def connect(
@@ -210,46 +162,39 @@ def connect(
     row_factory: Any = None,
     **kwargs: Any,
 ) -> psycopg.Connection[Any]:
-    """Connect to a dstack TEE database with RA-TLS attestation verification.
+    """Connect to a dstack TEE database with mutual RA-TLS verification.
 
-    Establishes a psycopg3 connection using TLS, extracts the TDX attestation
-    quote from the server certificate, and verifies it before returning.
-
-    Uses cluster secret-based authentication. Include the permission level as the
-    username (teesql_read or teesql_readwrite) and the cluster secret as the password
-    in the connection string.
+    The call opens an in-process RA-TLS forwarder bound to
+    ``127.0.0.1:<ephemeral>`` that terminates mutual RA-TLS against the
+    cluster and bridges bytes; psycopg then connects to the forwarder
+    with ``sslmode=disable``. The caller sees a standard
+    :class:`psycopg.Connection` and never has to reason about the TLS
+    plumbing.
 
     Args:
-        dsn: PostgreSQL connection string with teesql_read/teesql_readwrite user and cluster secret password.
-        verifier: Attestation verifier (IntelApiVerifier or NoopVerifier).
-        options: Verification options.
-        allow_simulator: Accept certs without attestation (dev only).
-        row_factory: psycopg row factory (default: dict_row).
-        **kwargs: Additional arguments passed to psycopg.connect().
+        dsn: URL-form postgres DSN. User/password/database are preserved;
+            host/port are rewritten to the forwarder's local address.
+        verifier: Attestation verifier applied to every upstream
+            handshake (e.g. ``IntelApiVerifier`` or ``NoopVerifier``).
+        options: Verification options (MRTD allowlist, debug mode).
+        allow_simulator: Accept upstream certs without an attestation
+            extension. Dev/test use only.
+        row_factory: psycopg row factory (default: ``dict_row``).
+        **kwargs: Passed through to :func:`psycopg.connect`.
 
     Raises:
-        RuntimeError: If attestation verification fails.
+        RuntimeError: If the RA-TLS handshake fails at the first
+            forwarded connection (surfaces as a psycopg connection error).
     """
-    options = options or VerifyOptions()
     if row_factory is None:
         row_factory = psycopg.rows.dict_row
 
-    ctx = create_ssl_context(verifier, options, allow_simulator)
+    target_host, target_port, _ = _parse_target(dsn)
+    fwd = _start_forwarder(target_host, target_port, verifier, options, allow_simulator)
+    local_host, local_port = fwd.local_addr
 
-    conn = psycopg.connect(
-        dsn,
-        sslcontext=ctx,
-        row_factory=row_factory,
-        **kwargs,
-    )
-
-    try:
-        _verify_peer_cert(conn, verifier, options, allow_simulator)
-    except Exception:
-        conn.close()
-        raise
-
-    return conn
+    local_dsn = _rewrite_to_forwarder(dsn, local_host, local_port)
+    return psycopg.connect(local_dsn, row_factory=row_factory, **kwargs)
 
 
 async def connect_async(
@@ -260,49 +205,15 @@ async def connect_async(
     row_factory: Any = None,
     **kwargs: Any,
 ) -> psycopg.AsyncConnection[Any]:
-    """Async version of connect().
-
-    Same attestation verification flow but returns an AsyncConnection.
-    Uses cluster secret-based authentication — see connect() for details.
-    """
-    options = options or VerifyOptions()
+    """Async variant of :func:`connect`. Same trust model + forwarder pattern."""
     if row_factory is None:
         row_factory = psycopg.rows.dict_row
 
-    ctx = create_ssl_context(verifier, options, allow_simulator)
+    target_host, target_port, _ = _parse_target(dsn)
+    fwd = _start_forwarder(target_host, target_port, verifier, options, allow_simulator)
+    local_host, local_port = fwd.local_addr
 
-    conn = await psycopg.AsyncConnection.connect(
-        dsn,
-        sslcontext=ctx,
-        row_factory=row_factory,
-        **kwargs,
+    local_dsn = _rewrite_to_forwarder(dsn, local_host, local_port)
+    return await psycopg.AsyncConnection.connect(
+        local_dsn, row_factory=row_factory, **kwargs
     )
-
-    try:
-        der_cert = _get_server_cert_der(conn.pgconn)
-        if der_cert is None:
-            if not allow_simulator:
-                await conn.close()
-                raise RuntimeError("Could not extract server certificate for attestation")
-            logger.warning("Could not extract server certificate, skipping attestation")
-        else:
-            quote = extract_tdx_quote(der_cert)
-            if quote is None:
-                if not allow_simulator:
-                    await conn.close()
-                    raise RuntimeError(
-                        "Server certificate does not contain a TDX attestation extension."
-                    )
-                logger.warning("Server cert has no TDX attestation extension (simulator mode)")
-            else:
-                result = await verifier.verify(quote, options)
-                logger.info(
-                    "RA-TLS verification passed: mrtd=%s tcb=%s",
-                    result.mr_td[:16] + "...",
-                    result.tcb_status,
-                )
-    except RuntimeError:
-        await conn.close()
-        raise
-
-    return conn

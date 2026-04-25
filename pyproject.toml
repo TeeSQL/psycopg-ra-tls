@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "psycopg-ra-tls"
-version = "0.2.0"
+version = "0.3.0"
 description = "psycopg3 driver with RA-TLS attestation verification for dstack TEE databases"
 readme = "README.md"
 license = "Apache-2.0"
@@ -14,6 +14,10 @@ dependencies = [
     "ra-tls-verify>=0.1.0",
     "dnspython>=2.4",
     "eth-account>=0.11",
+    # Fetches the TDX-attested client cert from /var/run/dstack.sock for
+    # the mutual-RA-TLS handshake. v0.5 has the get_tls_key signature we
+    # rely on (usage_ra_tls / usage_client_auth flags).
+    "dstack-sdk>=0.5",
 ]
 
 [project.optional-dependencies]
